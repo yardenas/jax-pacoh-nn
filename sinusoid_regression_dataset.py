@@ -12,27 +12,27 @@ class SinusoidRegression:
     @property
     def train_set(
         self,
-    ) -> Iterator[Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
+    ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         while True:
             yield self._make_batch()
 
     @property
     def eval_set(
         self,
-    ) -> Iterator[Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
+    ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         while True:
             yield self._make_batch()
 
     @property
     def test_set(
         self,
-    ) -> Iterator[Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
+    ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         while True:
             yield self._make_batch()
 
     def _make_batch(
         self,
-    ) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         # Select amplitude and phase for the task
         amplitudes = []
         phases = []
@@ -50,5 +50,4 @@ class SinusoidRegression:
             return np.stack(xs), np.stack(ys)
 
         x1, y1 = get_batch()
-        x2, y2 = get_batch()
-        return (x1, y1), (x2, y2)
+        return x1, y1
