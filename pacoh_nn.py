@@ -1,6 +1,5 @@
 import copy
-import functools
-from typing import Callable, Iterator, Tuple
+from typing import Callable, Iterator, Optional, Tuple
 
 import chex
 import distrax
@@ -8,6 +7,7 @@ import haiku as hk
 import jax
 import numpy as np
 import optax
+from jax.flatten_util import ravel_pytree  # type: ignore
 
 import models
 
@@ -22,9 +22,26 @@ def meta_train(
     iterations: int,
     n_prior_samples: int,
 ) -> models.ParamsMeanField:
+    """Approximate inference of a hyper-posterior, given a hyper-prior and prior.
+
+    Args:
+        data (Iterator[Tuple[np.ndarray, np.ndarray]]): The dataset to be learned.
+        prediction_fn (Callable[[hk.Params, chex.Array], chex.Array]): Parameterizd
+        function approximator.
+        hyper_prior (models.ParamsMeanField): Distribution over distributions of
+         parameterized functions.
+        prior (models.ParamsMeanField): Distribution over parameterized functions.
+        optimizer (optax.GradientTransformation): Optimizer.
+        opt_state (optax.OptState): Optimizer state.
+        iterations (int): Number of update iterations to be performed
+        n_prior_samples (int): Number of prior samples to draw for each task.
+
+    Returns:
+        models.ParamsMeanField: Trained hyper-posterior.
+    """
     hyper_posterior = copy.deepcopy(prior)
     keys = hk.PRNGSequence(42)
-    for i in range(iterations):
+    for _ in range(iterations):
         meta_batch_x, meta_batch_y = next(data)
         hyper_posterior, opt_state = train_step(
             meta_batch_x,
@@ -40,7 +57,7 @@ def meta_train(
     return hyper_posterior
 
 
-@functools.partial(jax.jit, static_argnums=(2, 6, 7))
+# @functools.partial(jax.jit, static_argnums=(2, 6, 7))
 def train_step(
     meta_batch_x: chex.Array,
     meta_batch_y: chex.Array,
@@ -52,8 +69,28 @@ def train_step(
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
 ) -> Tuple[models.ParamsMeanField, optax.OptState]:
+    """Approximate inference of a hyper-posterior, given a hyper-prior and prior.
+
+    Args:
+        meta_batch_x (chex.Array): Meta-batch of input data.
+        meta_batch_y (chex.Array): Meta-batch of output data.
+        prediction_fn (Callable[[hk.Params, chex.Array], chex.Array]): Parameterized
+        function approximator.
+        hyper_prior (models.ParamsMeanField): Prior distribution over distributions of
+        parameterized functions.
+        hyper_posterior (models.ParamsMeanField): Infered posterior distribution over
+        distributions parameterized functions.
+        key (chex.PRNGKey): PRNG key for stochasticity.
+        n_prior_samples (int): Number of prior samples to draw for each task.
+        optimizer (optax.GradientTransformation): Optimizer.
+        opt_state (optax.OptState): Initial optimizer state.
+
+    Returns:
+        Tuple[models.ParamsMeanField, optax.OptState]:
+        Trained hyper-posterior and optimizer state.
+    """
     grad_fn = jax.grad(
-        lambda p: particle_mll_loss(
+        lambda p: particle_loss(
             meta_batch_x,
             meta_batch_y,
             prediction_fn,
@@ -63,14 +100,38 @@ def train_step(
             n_prior_samples,
         )
     )
-    # vmap to compute the grads for each particle in the ensemble.
-    grads = jax.vmap(grad_fn)(hyper_posterior.params)
-    updates, new_opt_state = optimizer.update(grads, opt_state)
+    # vmap to compute the grads for each particle in the ensemble with respect
+    # to its prediction's log probability.
+    log_prob_grads = jax.vmap(grad_fn)(hyper_posterior.params)
+    # Compute the particles' kernel matrix and its per-particle gradients.
+    num_particles = jax.tree_util.tree_flatten(log_prob_grads)[0][0].shape[0]
+    particles_matrix, reconstruct_tree = _to_matrix(
+        hyper_posterior.params, num_particles
+    )
+    kxx, kernel_vjp = jax.vjp(
+        lambda x: rbf_kernel(x, particles_matrix), particles_matrix
+    )
+    # Summing along the 'particles axis' to compute the per-particle gradients, see
+    # https://jax.readthedocs.io/en/latest/notebooks/autodiff_cookbook.html
+    kernel_grads = kernel_vjp(jnp.ones(kxx.shape))[0]
+    stein_grads = (
+        jnp.matmul(kxx, _to_matrix(log_prob_grads, num_particles)[0]) + kernel_grads
+    ) / num_particles
+    stein_grads = reconstruct_tree(stein_grads.ravel())
+    updates, new_opt_state = optimizer.update(stein_grads, opt_state)
     new_params = optax.apply_updates(prior.params, updates)
     return models.ParamsMeanField(new_params), new_opt_state  # type: ignore
 
 
-def particle_mll_loss(
+def _to_matrix(
+    params: hk.Params, num_particles: int
+) -> Tuple[chex.Array, Callable[[chex.Array], hk.Params]]:
+    flattened_params, reconstruct_tree = ravel_pytree(params)
+    matrix = flattened_params.reshape((num_particles, -1))
+    return matrix, reconstruct_tree
+
+
+def particle_loss(
     meta_batch_x: chex.Array,
     meta_batch_y: chex.Array,
     prediction_fn: Callable[[hk.Params, chex.Array], chex.Array],
@@ -90,6 +151,8 @@ def particle_mll_loss(
         params (hk.Params): Particle's parameters to learn
         key (PRNGKey): Key for stochasticity.
         n_prior_samples (int): Number of samples.
+    Returns:
+        Array: Loss.
     """
 
     def estimate_mll(x: chex.Array, y: chex.Array) -> chex.Array:
@@ -111,20 +174,24 @@ def particle_mll_loss(
     return -(mll + log_prob_prior).mean()
 
 
-# # Based on tf-probability implementation of batched pairwise matrices:
-# # https://github.com/tensorflow/probability/blob
-# # /f3777158691787d3658b5e80883fe1a933d48989/tensorflow_probability/python
-# # /math/psd_kernels/internal/util.py#L190
-# def rbf_kernel(x, y, bandwidth=None):
-#     row_norm_x = (x**2).sum(-1)[..., None]
-#     row_norm_y = (y**2).sum(-1)[..., None, :]
-#     pairwise = jnp.clip(row_norm_x + row_norm_y - 2.0 * jnp.matmul(x, y.T), 0.0)
-#     n_x = pairwise.shape[-2]
-#     bandwidth = bandwidth or jnp.median(pairwise)
-#     bandwidth = 0.5 * bandwidth / jnp.log(n_x + 1)
-#     bandwidth = jnp.maximum(jax.lax.stop_gradient(bandwidth), 1e-5)
-#     k_xy = jnp.exp(-pairwise / bandwidth / 2)
-#     return k_xy
+# Based on tf-probability implementation of batched pairwise matrices:
+# https://github.com/tensorflow/probability/blob/f3777158691787d3658b5e80883fe1a933d48989/tensorflow_probability/python/math/psd_kernels/internal/util.py#L190
+def rbf_kernel(
+    x: chex.Array, y: chex.Array, bandwidth: Optional[chex.Numeric] = None
+) -> chex.Array:
+    """Computes the RBF kernel matrix between (batches of) x and y.
+    Returns (batches of) kernel matrices
+    :math:`K(x, y) = exp(-||x - y||^2 / (2 * bandwidth^2))`.
+    """
+    row_norm_x = (x**2).sum(-1)[..., None]
+    row_norm_y = (y**2).sum(-1)[..., None, :]
+    pairwise = jnp.clip(row_norm_x + row_norm_y - 2.0 * jnp.matmul(x, y.T), 0.0)
+    n_x = pairwise.shape[-2]
+    bandwidth = bandwidth if bandwidth is not None else jnp.median(pairwise)
+    bandwidth = 0.5 * bandwidth / jnp.log(n_x + 1)
+    bandwidth = jnp.maximum(jax.lax.stop_gradient(bandwidth), 1e-5)
+    k_xy = jnp.exp(-pairwise / bandwidth / 2)
+    return k_xy
 
 
 if __name__ == "__main__":
