@@ -4,9 +4,16 @@ import numpy as np
 
 
 class SinusoidRegression:
-    def __init__(self, meta_batch_size: int, num_shots: int, seed: int = 666):
+    def __init__(
+        self,
+        meta_batch_size: int,
+        num_train_shots: int,
+        num_test_shots: int,
+        seed: int = 666,
+    ):
         self.meta_batch_size = meta_batch_size
-        self.num_shots = num_shots
+        self.num_train_shots = num_train_shots
+        self.num_test_shots = num_test_shots
         self.rs = np.random.RandomState(seed)
 
     @property
@@ -14,25 +21,19 @@ class SinusoidRegression:
         self,
     ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         while True:
-            yield self._make_batch()
-
-    @property
-    def eval_set(
-        self,
-    ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
-        while True:
-            yield self._make_batch()
+            yield self._make_batch(self.num_train_shots)
 
     @property
     def test_set(
         self,
-    ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+    ) -> Iterator[Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
         while True:
-            yield self._make_batch()
+            yield (
+                self._make_batch(self.num_test_shots),
+                self._make_batch(-1),
+            )
 
-    def _make_batch(
-        self,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def _make_batch(self, num_shots: int) -> Tuple[np.ndarray, np.ndarray]:
         # Select amplitude and phase for the task
         amplitudes = []
         phases = []
@@ -43,7 +44,10 @@ class SinusoidRegression:
         def get_batch() -> Tuple[np.ndarray, np.ndarray]:
             xs, ys = [], []
             for amplitude, phase in zip(amplitudes, phases):
-                x = self.rs.uniform(low=-5.0, high=5.0, size=(self.num_shots, 1))
+                if num_shots > 0:
+                    x = self.rs.uniform(low=-5.0, high=5.0, size=(num_shots, 1))
+                else:
+                    x = np.linspace(-5.0, 5.0, 1000)[:, None]
                 y = amplitude * np.sin(x + phase)
                 xs.append(x)
                 ys.append(y)

@@ -1,11 +1,12 @@
 import copy
 import functools
-from typing import Callable, Iterator, Optional, Tuple
+from typing import Any, Callable, Iterator, Optional, Tuple
 
 import chex
 import distrax
 import haiku as hk
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 from jax.flatten_util import ravel_pytree  # type: ignore
@@ -15,7 +16,7 @@ import models
 
 def meta_train(
     data: Iterator[Tuple[np.ndarray, np.ndarray]],
-    prediction_fn: Callable[[hk.Params, chex.Array], chex.Array],
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
     hyper_prior: models.ParamsMeanField,
     prior: models.ParamsMeanField,
     optimizer: optax.GradientTransformation,
@@ -27,7 +28,7 @@ def meta_train(
 
     Args:
         data (Iterator[Tuple[np.ndarray, np.ndarray]]): The dataset to be learned.
-        prediction_fn (Callable[[hk.Params, chex.Array], chex.Array]): Parameterizd
+        prediction_fn (Callable[[chex.ArrayTree, chex.Array], chex.Array]): Parameterizd
         function approximator.
         hyper_prior (models.ParamsMeanField): Distribution over distributions of
          parameterized functions.
@@ -42,9 +43,9 @@ def meta_train(
     """
     hyper_posterior = copy.deepcopy(prior)
     keys = hk.PRNGSequence(42)
-    for _ in range(iterations):
+    for i in range(iterations):
         meta_batch_x, meta_batch_y = next(data)
-        hyper_posterior, opt_state = train_step(
+        hyper_posterior, opt_state, log_probs = train_step(
             meta_batch_x,
             meta_batch_y,
             prediction_fn,
@@ -55,6 +56,8 @@ def meta_train(
             optimizer,
             opt_state,
         )
+        if i % 100 == 0:
+            print(f"Iteration {i} log probs: {log_probs}")
     return hyper_posterior
 
 
@@ -62,20 +65,20 @@ def meta_train(
 def train_step(
     meta_batch_x: chex.Array,
     meta_batch_y: chex.Array,
-    prediction_fn: Callable[[hk.Params, chex.Array], chex.Array],
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
     hyper_prior: models.ParamsMeanField,
     hyper_posterior: models.ParamsMeanField,
     key: chex.PRNGKey,
     n_prior_samples: int,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
-) -> Tuple[models.ParamsMeanField, optax.OptState]:
+) -> Tuple[models.ParamsMeanField, optax.OptState, jnp.ndarray]:
     """Approximate inference of a hyper-posterior, given a hyper-prior and prior.
 
     Args:
         meta_batch_x (chex.Array): Meta-batch of input data.
         meta_batch_y (chex.Array): Meta-batch of output data.
-        prediction_fn (Callable[[hk.Params, chex.Array], chex.Array]): Parameterized
+        prediction_fn (Callable[[chex.ArrayTree, chex.Array], chex.Array]): Parameterized
         function approximator.
         hyper_prior (models.ParamsMeanField): Prior distribution over distributions of
         parameterized functions.
@@ -90,7 +93,7 @@ def train_step(
         Tuple[models.ParamsMeanField, optax.OptState]:
         Trained hyper-posterior and optimizer state.
     """
-    grad_fn = jax.grad(
+    grad_fn = jax.value_and_grad(
         lambda p: particle_loss(
             meta_batch_x,
             meta_batch_y,
@@ -103,7 +106,7 @@ def train_step(
     )
     # vmap to compute the grads for each particle in the ensemble with respect
     # to its prediction's log probability.
-    log_prob_grads = jax.vmap(grad_fn)(hyper_posterior.params)
+    log_probs, log_prob_grads = jax.vmap(grad_fn)(hyper_posterior.params)
     # Compute the particles' kernel matrix and its per-particle gradients.
     num_particles = jax.tree_util.tree_flatten(log_prob_grads)[0][0].shape[0]
     particles_matrix, reconstruct_tree = _to_matrix(
@@ -120,12 +123,12 @@ def train_step(
     ) / num_particles
     stein_grads = reconstruct_tree(stein_grads.ravel())
     updates, new_opt_state = optimizer.update(stein_grads, opt_state)
-    new_params = optax.apply_updates(prior.params, updates)
-    return models.ParamsMeanField(new_params), new_opt_state  # type: ignore
+    new_params = optax.apply_updates(hyper_posterior.params, updates)
+    return (models.ParamsMeanField(new_params), new_opt_state, log_probs.mean())
 
 
 def _to_matrix(
-    params: hk.Params, num_particles: int
+    params: chex.ArrayTree, num_particles: int
 ) -> Tuple[chex.Array, Callable[[chex.Array], hk.Params]]:
     flattened_params, reconstruct_tree = ravel_pytree(params)
     matrix = flattened_params.reshape((num_particles, -1))
@@ -135,7 +138,7 @@ def _to_matrix(
 def particle_loss(
     meta_batch_x: chex.Array,
     meta_batch_y: chex.Array,
-    prediction_fn: Callable[[hk.Params, chex.Array], chex.Array],
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
     params: hk.Params,
     hyper_prior: models.ParamsMeanField,
     key: chex.PRNGKey,
@@ -195,31 +198,81 @@ def rbf_kernel(
     return k_xy
 
 
-if __name__ == "__main__":
-    import haiku as hk
-    import jax.numpy as jnp
-    import optax
+@functools.partial(jax.jit, static_argnums=(3, 5))
+def infer_posterior(
+    x: chex.Array,
+    y: chex.Array,
+    hyper_posterior: models.ParamsMeanField,
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
+    key: chex.PRNGKey,
+    update_steps: int,
+    learning_rate: float,
+) -> Tuple[chex.ArrayTree, chex.Array]:
+    """Infer posterior based on task specific training data.
+    The posterior is modeled as an ensemble of neural networks.
 
-    import models
-    import sinusoid_regression_dataset
+    Args:
+        x (chex.Array): x-values of task-specific training data.
+        [task_dim, batch_dim, input_dim]
+        y (chex.Array): y-values of task-specific training data.
+        [task_dim, batch_dim, output_dim]
+        hyper_posterior (models.ParamsMeanField): Distribution over distributions of
+         parameterized functions.
+        prediction_fn (Callable[[chex.ArrayTree, chex.Array], chex.Array]):
+        parameterizd function.
+        key (chex.PRNGKey): PRNG key.
+        update_steps (int): Number of update steps to be performed.
 
-    dataset = sinusoid_regression_dataset.SinusoidRegression(16, 5, 666)
-
-    def net(x: chex.Array) -> Tuple[chex.Array, chex.Array]:
-        x = hk.nets.MLP((32, 32, 32, 32, 2))(x)
-        mu, stddev = jnp.split(x, 2, -1)
-        return mu, stddev
-
-    init, apply = hk.without_apply_rng(hk.transform(net))
-    example = next(dataset.train_set)[0][0]
-    seed_sequence = hk.PRNGSequence(666)
-    hyper_prior = models.ParamsMeanField(
-        jax.tree_map(jnp.zeros_like, init(next(seed_sequence), example))
+    Returns:
+        models.ParamsMeanField: Task-inferred posterior.
+    """
+    # Sample prior parameters from the hyper-posterior to form an ensemble
+    # of neural networks.
+    posterior_params = hyper_posterior.sample(key, 1)
+    posterior_params = jax.tree_util.tree_map(
+        lambda x: x.reshape((-1,) + x.shape[2:]), posterior_params
     )
-    n_particles = 10
-    init = jax.vmap(init, (0, None))
-    prior_particles = init(jnp.asarray(seed_sequence.take(n_particles)), example)
-    prior = models.ParamsMeanField(prior_particles)
-    opt = optax.flatten(optax.adam(2e-3))
-    opt_state = opt.init(prior_particles)
-    meta_train(dataset.train_set, apply, hyper_prior, prior, opt, opt_state, 1, 10)
+    optimizer = optax.flatten(optax.adam(learning_rate))
+    opt_state = optimizer.init(posterior_params)
+
+    def loss(params: hk.Params) -> chex.Array:
+        y_hat, stddevs = prediction_fn(params, x)
+        log_likelihood = distrax.MultivariateNormalDiag(y_hat, stddevs).log_prob(y)
+        return -log_likelihood.mean()
+
+    def update(
+        carry: Tuple[chex.ArrayTree, optax.OptState], _: Any
+    ) -> Tuple[Tuple[chex.ArrayTree, optax.OptState], chex.Array]:
+        posterior_params, opt_state = carry
+        values, grads = jax.vmap(jax.value_and_grad(loss))(posterior_params)
+        updates, opt_state = optimizer.update(grads, opt_state)
+        posterior_params = optax.apply_updates(posterior_params, updates)
+        return (posterior_params, opt_state), values.mean()
+
+    (posterior_params, _), losses = jax.lax.scan(
+        update, (posterior_params, opt_state), None, update_steps
+    )
+    return posterior_params, losses
+
+
+@functools.partial(jax.jit, static_argnums=(2))
+def predict(
+    posterior: chex.ArrayTree,
+    x: chex.Array,
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
+) -> Tuple[chex.Array, chex.Array]:
+    """Predict y-values based on the posterior (defined by an ensemble of
+     neural networks).
+    Args:
+        posterior (chex.ArrayTree): Posterior parameters.
+        x (chex.Array): x-values of task-specific training data.
+        prediction_fn (Callable[[chex.ArrayTree, chex.Array], chex.Array]): Parameterized
+        function.
+
+    Returns:
+        chex.Array: Prediced mean and standard deviation predicted by each member
+        of the ensemble that defines the ensemble.
+    """
+    prediction_fn = jax.vmap(prediction_fn, in_axes=(0, None))
+    y_hat, stddev = prediction_fn(posterior, x)
+    return y_hat, stddev
