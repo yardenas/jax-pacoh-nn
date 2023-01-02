@@ -8,7 +8,7 @@ from jax.flatten_util import ravel_pytree  # type: ignore
 
 
 class ParamsMeanField(NamedTuple):
-    params: hk.Params
+    params: chex.ArrayTree
 
     def log_prob(self, params: hk.Params) -> chex.Array:
         """Measures the log probability of (batches of) parameter samples.

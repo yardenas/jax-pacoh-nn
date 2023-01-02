@@ -1,6 +1,6 @@
 import copy
 import functools
-from typing import Callable, Iterator, Optional, Tuple
+from typing import Any, Callable, Iterator, Optional, Tuple
 
 import chex
 import distrax
@@ -15,7 +15,7 @@ import models
 
 def meta_train(
     data: Iterator[Tuple[np.ndarray, np.ndarray]],
-    prediction_fn: Callable[[hk.Params, chex.Array], chex.Array],
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
     hyper_prior: models.ParamsMeanField,
     prior: models.ParamsMeanField,
     optimizer: optax.GradientTransformation,
@@ -27,7 +27,7 @@ def meta_train(
 
     Args:
         data (Iterator[Tuple[np.ndarray, np.ndarray]]): The dataset to be learned.
-        prediction_fn (Callable[[hk.Params, chex.Array], chex.Array]): Parameterizd
+        prediction_fn (Callable[[chex.ArrayTree, chex.Array], chex.Array]): Parameterizd
         function approximator.
         hyper_prior (models.ParamsMeanField): Distribution over distributions of
          parameterized functions.
@@ -62,7 +62,7 @@ def meta_train(
 def train_step(
     meta_batch_x: chex.Array,
     meta_batch_y: chex.Array,
-    prediction_fn: Callable[[hk.Params, chex.Array], chex.Array],
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
     hyper_prior: models.ParamsMeanField,
     hyper_posterior: models.ParamsMeanField,
     key: chex.PRNGKey,
@@ -75,7 +75,7 @@ def train_step(
     Args:
         meta_batch_x (chex.Array): Meta-batch of input data.
         meta_batch_y (chex.Array): Meta-batch of output data.
-        prediction_fn (Callable[[hk.Params, chex.Array], chex.Array]): Parameterized
+        prediction_fn (Callable[[chex.ArrayTree, chex.Array], chex.Array]): Parameterized
         function approximator.
         hyper_prior (models.ParamsMeanField): Prior distribution over distributions of
         parameterized functions.
@@ -125,7 +125,7 @@ def train_step(
 
 
 def _to_matrix(
-    params: hk.Params, num_particles: int
+    params: chex.ArrayTree, num_particles: int
 ) -> Tuple[chex.Array, Callable[[chex.Array], hk.Params]]:
     flattened_params, reconstruct_tree = ravel_pytree(params)
     matrix = flattened_params.reshape((num_particles, -1))
@@ -135,7 +135,7 @@ def _to_matrix(
 def particle_loss(
     meta_batch_x: chex.Array,
     meta_batch_y: chex.Array,
-    prediction_fn: Callable[[hk.Params, chex.Array], chex.Array],
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
     params: hk.Params,
     hyper_prior: models.ParamsMeanField,
     key: chex.PRNGKey,
@@ -195,6 +195,84 @@ def rbf_kernel(
     return k_xy
 
 
+@functools.partial(jax.jit, static_argnums=(3, 5))
+def infer_posterior(
+    x: chex.Array,
+    y: chex.Array,
+    hyper_posterior: models.ParamsMeanField,
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
+    key: chex.PRNGKey,
+    update_steps: int,
+    learning_rate: float,
+) -> Tuple[chex.ArrayTree, chex.Array]:
+    """Infer posterior based on task specific training data.
+    The posterior is modeled as an ensemble of neural networks.
+
+    Args:
+        x (chex.Array): x-values of task-specific training data.
+        y (chex.Array): y-values of task-specific training data.
+        hyper_posterior (models.ParamsMeanField): Distribution over distributions of
+         parameterized functions.
+        prediction_fn (Callable[[chex.ArrayTree, chex.Array], chex.Array]):
+        parameterizd function.
+        key (chex.PRNGKey): PRNG key.
+        update_steps (int): Number of update steps to be performed.
+
+    Returns:
+        models.ParamsMeanField: Task-inferred posterior.
+    """
+    # Sample prior parameters from the hyper-posterior to form an ensemble
+    # of neural networks.
+    posterior_params = hyper_posterior.sample(key, 1)
+    posterior_params = jax.tree_util.tree_map(
+        lambda x: x.reshape((-1,) + x.shape[2:]), posterior_params
+    )
+    optimizer = optax.flatten(optax.adam(learning_rate))
+    opt_state = optimizer.init(posterior_params)
+
+    def loss(params: hk.Params) -> chex.Array:
+        y_hat, stddevs = prediction_fn(params, x)
+        log_likelihood = distrax.MultivariateNormalDiag(y_hat, stddevs).log_prob(y)
+        return -log_likelihood.mean()
+
+    def update(
+        carry: Tuple[chex.ArrayTree, optax.OptState], _: Any
+    ) -> Tuple[Tuple[chex.ArrayTree, optax.OptState], chex.Array]:
+        posterior_params, opt_state = carry
+        values, grads = jax.vmap(jax.value_and_grad(loss))(posterior_params)
+        updates, opt_state = optimizer.update(grads, opt_state)
+        posterior_params = optax.apply_updates(posterior_params, updates)
+        return (posterior_params, opt_state), values.mean()
+
+    (posterior_params, _), losses = jax.lax.scan(
+        update, (posterior_params, opt_state), None, update_steps
+    )
+    return posterior_params, losses
+
+
+@functools.partial(jax.jit, static_argnums=(2))
+def predict(
+    posterior: chex.ArrayTree,
+    x: chex.Array,
+    prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
+) -> Tuple[chex.Array, chex.Array]:
+    """Predict y-values based on the posterior (defined by an ensemble of
+     neural networks).
+    Args:
+        posterior (chex.ArrayTree): Posterior parameters.
+        x (chex.Array): x-values of task-specific training data.
+        prediction_fn (Callable[[chex.ArrayTree, chex.Array], chex.Array]): Parameterized
+        function.
+
+    Returns:
+        chex.Array: Prediced mean and standard deviation predicted by each member
+        of the ensemble that defines the ensemble.
+    """
+    prediction_fn = jax.vmap(prediction_fn, in_axes=(0, None))
+    y_hat, stddev = prediction_fn(posterior, x)
+    return y_hat, stddev
+
+
 if __name__ == "__main__":
     import haiku as hk
     import jax.numpy as jnp
@@ -203,7 +281,7 @@ if __name__ == "__main__":
     import models
     import sinusoid_regression_dataset
 
-    dataset = sinusoid_regression_dataset.SinusoidRegression(16, 5, 666)
+    dataset = sinusoid_regression_dataset.SinusoidRegression(16, 5, 50)
 
     def net(x: chex.Array) -> Tuple[chex.Array, chex.Array]:
         x = hk.nets.MLP((32, 32, 32, 32, 2))(x)
@@ -222,4 +300,17 @@ if __name__ == "__main__":
     prior = models.ParamsMeanField(prior_particles)
     opt = optax.flatten(optax.adam(2e-3))
     opt_state = opt.init(prior_particles)
-    meta_train(dataset.train_set, apply, hyper_prior, prior, opt, opt_state, 1, 10)
+    hyper_posterior = meta_train(
+        dataset.train_set, apply, hyper_prior, prior, opt, opt_state, 1, 10
+    )
+    (train_x, train_y), (test_x, test_y) = next(dataset.test_set)
+    posterior, _ = infer_posterior(
+        jnp.array(train_x)[0],
+        jnp.array(train_y)[0],
+        hyper_posterior,
+        apply,
+        next(seed_sequence),
+        100,
+        2e-3,
+    )
+    y_hat, stddev = predict(posterior, jnp.array(test_x)[0], apply)
