@@ -1,4 +1,5 @@
 import copy
+import functools
 from typing import Callable, Iterator, Optional, Tuple
 
 import chex
@@ -57,7 +58,7 @@ def meta_train(
     return hyper_posterior
 
 
-# @functools.partial(jax.jit, static_argnums=(2, 6, 7))
+@functools.partial(jax.jit, static_argnums=(2, 6, 7))
 def train_step(
     meta_batch_x: chex.Array,
     meta_batch_y: chex.Array,
