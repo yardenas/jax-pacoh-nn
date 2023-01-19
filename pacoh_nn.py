@@ -18,7 +18,7 @@ def meta_train(
     data: Iterator[Tuple[np.ndarray, np.ndarray]],
     prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
     hyper_prior: models.ParamsMeanField,
-    prior: models.ParamsMeanField,
+    hyper_posterior: models.ParamsMeanField,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
     iterations: int,
@@ -32,7 +32,8 @@ def meta_train(
         function approximator.
         hyper_prior (models.ParamsMeanField): Distribution over distributions of
          parameterized functions.
-        prior (models.ParamsMeanField): Distribution over parameterized functions.
+        hyper_posterior (models.ParamsMeanField): Distribution over distributions of
+         parameterized functions.
         optimizer (optax.GradientTransformation): Optimizer.
         opt_state (optax.OptState): Optimizer state.
         iterations (int): Number of update iterations to be performed
@@ -41,7 +42,7 @@ def meta_train(
     Returns:
         models.ParamsMeanField: Trained hyper-posterior.
     """
-    hyper_posterior = copy.deepcopy(prior)
+    hyper_posterior = copy.deepcopy(hyper_posterior)
     keys = hk.PRNGSequence(42)
     for i in range(iterations):
         meta_batch_x, meta_batch_y = next(data)
@@ -76,29 +77,26 @@ def train_step(
     """Approximate inference of a hyper-posterior, given a hyper-prior and prior.
 
     Args:
-        meta_batch_x (chex.Array): Meta-batch of input data.
-        meta_batch_y (chex.Array): Meta-batch of output data.
-        prediction_fn (Callable[[chex.ArrayTree, chex.Array], chex.Array]): Parameterized
-        function approximator.
-        hyper_prior (models.ParamsMeanField): Prior distribution over distributions of
-        parameterized functions.
-        hyper_posterior (models.ParamsMeanField): Infered posterior distribution over
-        distributions parameterized functions.
-        key (chex.PRNGKey): PRNG key for stochasticity.
-        n_prior_samples (int): Number of prior samples to draw for each task.
-        optimizer (optax.GradientTransformation): Optimizer.
-        opt_state (optax.OptState): Initial optimizer state.
+        meta_batch_x: Meta-batch of input data.
+        meta_batch_y: Meta-batch of output data.
+        prediction_fn: Parameterized function approximator.
+        hyper_prior: Prior distribution over distributions of parameterized functions.
+        hyper_posterior: Infered posterior distribution over distributions
+            parameterized functions.
+        key: PRNG key for stochasticity.
+        n_prior_samples: Number of prior samples to draw for each task.
+        optimizer: Optimizer.
+        opt_state: Initial optimizer state.
 
     Returns:
-        Tuple[models.ParamsMeanField, optax.OptState]:
         Trained hyper-posterior and optimizer state.
     """
     grad_fn = jax.value_and_grad(
-        lambda p: particle_loss(
+        lambda hyper_posterior: particle_loss(
             meta_batch_x,
             meta_batch_y,
             prediction_fn,
-            p,
+            hyper_posterior,
             hyper_prior,
             key,
             n_prior_samples,
@@ -106,12 +104,10 @@ def train_step(
     )
     # vmap to compute the grads for each particle in the ensemble with respect
     # to its prediction's log probability.
-    log_probs, log_prob_grads = jax.vmap(grad_fn)(hyper_posterior.params)
+    log_probs, log_prob_grads = jax.vmap(grad_fn)(hyper_posterior)
     # Compute the particles' kernel matrix and its per-particle gradients.
     num_particles = jax.tree_util.tree_flatten(log_prob_grads)[0][0].shape[0]
-    particles_matrix, reconstruct_tree = _to_matrix(
-        hyper_posterior.params, num_particles
-    )
+    particles_matrix, reconstruct_tree = _to_matrix(hyper_posterior, num_particles)
     kxx, kernel_vjp = jax.vjp(
         lambda x: rbf_kernel(x, particles_matrix), particles_matrix
     )
@@ -123,8 +119,8 @@ def train_step(
     ) / num_particles
     stein_grads = reconstruct_tree(stein_grads.ravel())
     updates, new_opt_state = optimizer.update(stein_grads, opt_state)
-    new_params = optax.apply_updates(hyper_posterior.params, updates)
-    return (models.ParamsMeanField(new_params), new_opt_state, log_probs.mean())
+    new_params = optax.apply_updates(hyper_posterior, updates)
+    return (models.ParamsMeanField(*new_params), new_opt_state, log_probs.mean())
 
 
 def _to_matrix(
@@ -139,7 +135,7 @@ def particle_loss(
     meta_batch_x: chex.Array,
     meta_batch_y: chex.Array,
     prediction_fn: Callable[[chex.ArrayTree, chex.Array], chex.Array],
-    params: hk.Params,
+    particle: models.ParamsMeanField,
     hyper_prior: models.ParamsMeanField,
     key: chex.PRNGKey,
     n_prior_samples: int,
@@ -160,7 +156,7 @@ def particle_loss(
     """
 
     def estimate_mll(x: chex.Array, y: chex.Array) -> chex.Array:
-        prior_samples = models.ParamsMeanField(params).sample(key, n_prior_samples)
+        prior_samples = particle.sample(key, n_prior_samples)
         per_sample_pred = jax.vmap(prediction_fn, (0, None))
         y_hat, stddevs = per_sample_pred(prior_samples, x)
         log_likelihood = distrax.MultivariateNormalDiag(y_hat, stddevs).log_prob(y)
@@ -174,7 +170,7 @@ def particle_loss(
     # @ Algorithm 1 PACOH with SVGD approximation of Q∗ (MLL_Estimator)
     # @ https://arxiv.org/pdf/2002.05551.pdf.
     mll = jax.vmap(estimate_mll)(meta_batch_x, meta_batch_y)
-    log_prob_prior = hyper_prior.log_prob(params)
+    log_prob_prior = hyper_prior.log_prob(particle) * 0.0
     return -(mll + log_prob_prior).mean()
 
 
@@ -276,3 +272,62 @@ def predict(
     prediction_fn = jax.vmap(prediction_fn, in_axes=(0, None))
     y_hat, stddev = prediction_fn(posterior, x)
     return y_hat, stddev
+
+
+if __name__ == "__main__":
+    import functools
+
+    import haiku as hk
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import optax
+
+    import models
+    import pacoh_nn as pacoh
+    import sinusoid_regression_dataset
+
+    dataset = sinusoid_regression_dataset.SinusoidRegression(16, 5, 5)
+
+    def net(x: jnp.ndarray) -> jnp.ndarray:
+        x = hk.nets.MLP((32, 32, 32, 32, 1))(x)
+        mu = x
+        # mu, stddev = jnp.split(x, 2, -1)
+        # stddev = jnp.clip(jnn.softplus(stddev), 1e-3, 0.5)
+        stddev = hk.get_parameter(
+            "stddev", [], init=lambda shape, dtype: jnp.ones(shape, dtype) * 1e-3
+        )
+        return mu, stddev * jnp.ones_like(mu)
+
+    init, apply = hk.without_apply_rng(hk.transform(net))
+    example = next(dataset.train_set)[0][0]
+    seed_sequence = hk.PRNGSequence(666)
+    mean_prior_over_mus = jax.tree_map(
+        jnp.zeros_like, init(next(seed_sequence), example)
+    )
+    mean_prior_over_stddevs = jax.tree_map(jnp.zeros_like, mean_prior_over_mus)
+    hyper_prior = models.ParamsMeanField(
+        models.ParamsMeanField(mean_prior_over_mus, mean_prior_over_stddevs),
+        1.0,
+    )
+    n_particles = 10
+    init = jax.vmap(init, (0, None))
+    particles_mus = init(jnp.asarray(seed_sequence.take(n_particles)), example)
+    particle_stddevs = jax.tree_map(lambda x: jnp.ones_like(x) * 1e-4, particles_mus)
+    hyper_posterior = models.ParamsMeanField(particles_mus, particle_stddevs)
+    opt = optax.flatten(optax.adam(3e-4))
+    opt_state = opt.init(hyper_posterior)
+    hyper_posterior = pacoh.meta_train(
+        dataset.train_set, apply, hyper_prior, hyper_posterior, opt, opt_state, 1000, 10
+    )
+    easy_dataset = sinusoid_regression_dataset.SinusoidRegression(16, 5, 100)
+    infer_posteriors = jax.vmap(
+        pacoh.infer_posterior, in_axes=(0, 0, None, None, None, None, None)
+    )
+
+    (context_x, context_y), (test_x, test_y) = next(easy_dataset.test_set)
+    posteriors, losses = infer_posteriors(
+        context_x, context_y, hyper_posterior, apply, next(seed_sequence), 1000, 3e-4
+    )
+    predict = jax.vmap(predict, (0, 0, None))
+    predictions = predict(posteriors, test_x, apply)

@@ -4,13 +4,15 @@ import chex
 import distrax
 import haiku as hk
 import jax
+import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree  # type: ignore
 
 
 class ParamsMeanField(NamedTuple):
-    params: chex.ArrayTree
+    mus: chex.ArrayTree
+    stddev: chex.ArrayTree
 
-    def log_prob(self, params: hk.Params) -> chex.Array:
+    def log_prob(self, params: chex.ArrayTree) -> chex.Array:
         """Measures the log probability of (batches of) parameter samples.
 
         Args:
@@ -47,6 +49,9 @@ class ParamsMeanField(NamedTuple):
     def _to_dist(
         self,
     ) -> Tuple[distrax.Distribution, chex.Array, Callable[[chex.Array], Any]]:
-        self_flat_params, pytree_def = ravel_pytree(self.params)
-        dist = distrax.MultivariateNormalDiag(self_flat_params)
-        return dist, self_flat_params, pytree_def
+        self_flat_mus, pytree_def = ravel_pytree(self.mus)
+        self_flat_stddevs, _ = ravel_pytree(self.stddev)
+        dist = distrax.MultivariateNormalDiag(
+            self_flat_mus, jnp.ones_like(self_flat_mus) * self_flat_stddevs
+        )
+        return dist, self_flat_mus, pytree_def
