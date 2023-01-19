@@ -170,7 +170,7 @@ def particle_loss(
     # @ Algorithm 1 PACOH with SVGD approximation of Q∗ (MLL_Estimator)
     # @ https://arxiv.org/pdf/2002.05551.pdf.
     mll = jax.vmap(estimate_mll)(meta_batch_x, meta_batch_y)
-    log_prob_prior = hyper_prior.log_prob(particle) * 0.0
+    log_prob_prior = hyper_prior.log_prob(particle)
     return -(mll + log_prob_prior).mean()
 
 
