@@ -251,7 +251,7 @@ def infer_posterior(
     return posterior_params, losses
 
 
-@functools.partial(jax.jit, static_argnums=(2))
+# @functools.partial(jax.jit, static_argnums=(2))
 def predict(
     posterior: chex.ArrayTree,
     x: chex.Array,
@@ -292,8 +292,6 @@ if __name__ == "__main__":
     def net(x: jnp.ndarray) -> jnp.ndarray:
         x = hk.nets.MLP((32, 32, 32, 32, 1))(x)
         mu = x
-        # mu, stddev = jnp.split(x, 2, -1)
-        # stddev = jnp.clip(jnn.softplus(stddev), 1e-3, 0.5)
         stddev = hk.get_parameter(
             "stddev", [], init=lambda shape, dtype: jnp.ones(shape, dtype) * 1e-3
         )
@@ -331,3 +329,5 @@ if __name__ == "__main__":
     )
     predict = jax.vmap(predict, (0, 0, None))
     predictions = predict(posteriors, test_x, apply)
+    posteriors = hyper_posterior.sample(next(seed_sequence), 1)
+    predict(posteriors, test_x, apply)

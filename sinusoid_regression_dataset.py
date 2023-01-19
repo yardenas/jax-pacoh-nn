@@ -35,8 +35,8 @@ class SinusoidRegression:
         amplitudes = []
         phases = []
         for _ in range(self.meta_batch_size):
-            amplitudes.append(self.rs.uniform(low=0.1, high=0.5))
-            phases.append(self.rs.uniform(low=0.0, high=np.pi))
+            amplitudes.append(self.rs.uniform(low=0.1, high=0.75))
+            phases.append(self.rs.uniform(low=-np.pi, high=np.pi))
 
         def get_batch(num_shots: int) -> Tuple[np.ndarray, np.ndarray]:
             xs, ys = [], []
